@@ -1,0 +1,16 @@
+Profile,K,Precision,Recall,F1,NDCG
+Data Science Profile,3,1.0,1.0,1.0,1.0
+Data Science Profile,5,0.6,1.0,0.75,1.0
+Data Science Profile,10,0.3,1.0,0.462,1.0
+Web Development Profile,3,0.667,1.0,0.8,1.0
+Web Development Profile,5,0.4,1.0,0.571,1.0
+Web Development Profile,10,0.2,1.0,0.333,1.0
+Marketing Profile,3,1.0,0.6,0.75,1.0
+Marketing Profile,5,1.0,1.0,1.0,1.0
+Marketing Profile,10,0.5,1.0,0.667,1.0
+Backend Profile,3,0.333,0.5,0.4,0.613
+Backend Profile,5,0.2,0.5,0.286,0.613
+Backend Profile,10,0.1,0.5,0.167,0.613
+Design Profile,3,0.333,1.0,0.5,1.0
+Design Profile,5,0.2,1.0,0.333,1.0
+Design Profile,10,0.1,1.0,0.182,1.0

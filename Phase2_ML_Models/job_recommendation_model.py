@@ -5,6 +5,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import MultiLabelBinarizer, normalize
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse import hstack
+import joblib
 
 # Data Cleaning
 def clean_job_data(file_path):
@@ -28,12 +29,17 @@ def extract_features(df):
     text_corpus = df['Job Title'] + " " + df['Required Skills']
     
     # TF-IDF for text features
-    tfidf = TfidfVectorizer(stop_words='english', max_features=1000)
+    # IMPROVEMENT: Use ngram_range=(1, 2) to capture phrases like "Data Scientist"
+    tfidf = TfidfVectorizer(stop_words='english', max_features=2000, ngram_range=(1, 2))
     text_features = tfidf.fit_transform(text_corpus)
     
     # Multi-hot encoding for Skills
     mlb = MultiLabelBinarizer()
     skill_features = mlb.fit_transform(df['skills_list'])
+    
+    # IMPROVEMENT: Weight skills higher than general text (2x importance)
+    # This ensures that exact skill matches drive the recommendation more than generic text
+    skill_features = skill_features.astype(float) * 2.0
     
     # Combine text and skill features using sparse-safe hstack
     combined = hstack([text_features, skill_features])
@@ -46,11 +52,14 @@ def extract_features(df):
 def get_recommendations(user_skills, tfidf, mlb, embeddings, df, top_k=3):
     """Matches user skills against the job database and identifies gaps."""
     # Preprocess user input
-    user_skills_clean = [s.lower() for s in user_skills]
+    user_skills_clean = [s.strip().lower() for s in user_skills]
     
     # Vectorize user input
     user_text_vec = tfidf.transform([" ".join(user_skills_clean)])
     user_skill_vec = mlb.transform([user_skills_clean])
+    
+    # Apply same weighting to user skills
+    user_skill_vec = user_skill_vec.astype(float) * 2.0
     
     # Combine and normalize user vector
     user_combined = hstack([user_text_vec, user_skill_vec])
@@ -73,10 +82,28 @@ def get_recommendations(user_skills, tfidf, mlb, embeddings, df, top_k=3):
             "Job Title": job['Job Title'],
             "Company": job['Company'],
             "Match Score": f"{round(scores[idx] * 100, 1)}%",
-            "Missing Skills": missing_skills[:3] # Suggest top 3 missing skills
+            "Missing Skills": missing_skills[:3], # Suggest top 3 missing skills
+            "Required Skills": job['skills_list']  # Include all required skills for frontend
         })
         
     return recommendations
+
+def save_model_artifacts(filepath, tfidf, mlb, embeddings, df):
+    """Saves the model artifacts to a single file using joblib."""
+    artifacts = {
+        "tfidf": tfidf,
+        "mlb": mlb,
+        "embeddings": embeddings,
+        "df": df
+    }
+    joblib.dump(artifacts, filepath)
+    print(f"Model artifacts saved to {filepath}")
+
+def load_model_artifacts(filepath):
+    """Loads model artifacts from a file."""
+    if not os.path.exists(filepath):
+        return None
+    return joblib.load(filepath)
 
 # --- EXECUTION ---
 if __name__ == "__main__":
@@ -97,7 +124,21 @@ if __name__ == "__main__":
     # 2. Preprocess
     tfidf_model, mlb_model, job_vectors = extract_features(jobs_df)
     
-    # 3. Recommend (Example Input)
+    # 3. Save Model (Local Test)
+    # Target Phase 3 directory
+    # Assuming script is run from Phase2 or root, we try to locate Phase 3 relative to this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Go up one level to SkillSync, then into Phase3
+    phase3_dir = os.path.abspath(os.path.join(script_dir, "..", "Phase3_Backend_APIs"))
+    
+    if not os.path.exists(phase3_dir):
+        os.makedirs(phase3_dir)
+        print(f"Created directory: {phase3_dir}")
+        
+    MODEL_PATH = os.path.join(phase3_dir, "job_recommendation_model.pkl")
+    save_model_artifacts(MODEL_PATH, tfidf_model, mlb_model, job_vectors, jobs_df)
+    
+    # 4. Recommend (Example Input)
     user_input_skills = ["Social Media", "Content Writing", "SEO"]
 
     results = get_recommendations(user_input_skills, tfidf_model, mlb_model, job_vectors, jobs_df)
@@ -108,5 +149,4 @@ if __name__ == "__main__":
         print(f"==> {r['Job Title']} at {r['Company']} | Match: {r['Match Score']}") 
         if r['Missing Skills']:
             print(f"   💡 Learn these to improve: {', '.join(r['Missing Skills'])}")
-
 
