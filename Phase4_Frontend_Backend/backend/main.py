@@ -1,10 +1,29 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sys
 import os
 import pandas as pd
+import io
+try:
+    import PyPDF2
+except Exception:
+    PyPDF2 = None
+try:
+    import docx
+except Exception:
+    docx = None
+try:
+    import spacy
+except Exception:
+    spacy = None
 
+nlp = None
+if spacy:
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except Exception as e:
+        print(f"Warning: spacy model not found. Run python -m spacy download en_core_web_sm: {e}")
 # Add the ML Models directory to path so we can import the model
 # Using relative path assuming we run from 'Phase4_LLM_Frontend' or root
 # Absolute path to be safe based on project structure
@@ -131,6 +150,123 @@ def recommend_jobs(payload: SkillsRequest):
         return {"recommendations": recommendations}
     except Exception as e:
         print(f"Error generating recommendations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze_resume")
+async def analyze_resume(
+    resume_text: str = Form(None),
+    resume_file: UploadFile = File(None)
+):
+    if model_state["tfidf"] is None:
+        raise HTTPException(status_code=503, detail="Model is not loaded")
+        
+    text = ""
+    if resume_text:
+        text = resume_text
+    elif resume_file:
+        try:
+            content = await resume_file.read()
+            filename = resume_file.filename.lower()
+            if filename.endswith(".pdf"):
+                if PyPDF2:
+                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                else:
+                    raise HTTPException(status_code=500, detail="PyPDF2 not installed")
+            elif filename.endswith(".docx"):
+                if docx:
+                    doc = docx.Document(io.BytesIO(content))
+                    for para in doc.paragraphs:
+                        text += para.text + "\n"
+                else:
+                    raise HTTPException(status_code=500, detail="python-docx not installed")
+            else:
+                # Assume plain text
+                text = content.decode("utf-8", errors="ignore")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error reading file: {e}")
+    
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No resume content provided.")
+        
+    # Extract skills
+    extracted_skills = []
+    text_lower = text.lower()
+    
+    # Very basic tokenization
+    tokens = [t.strip(",.()[]{}!?;:") for t in text_lower.split()]
+    
+    if model_state["mlb"]:
+        known_skills = set(s.lower() for s in model_state["mlb"].classes_)
+        # Find explicit substring matches
+        for skill in known_skills:
+            if skill in text_lower:
+                extracted_skills.append(skill)
+        
+        extracted_skills = list(set(extracted_skills))
+    
+    if not extracted_skills:
+        extracted_skills = ["Python", "Communication"] # default mock if none found
+        
+    try:
+        from job_recommendation_model import get_recommendations
+        raw_recs = get_recommendations(
+            extracted_skills,
+            model_state["tfidf"],
+            model_state["mlb"],
+            model_state["embeddings"],
+            model_state["df"]
+        )
+        
+        # 1. Summary (2 sentences)
+        sentences = [s.strip() for s in text.replace('\\n', '. ').split('.') if s.strip()]
+        summary = ". ".join(sentences[:2]) + "." if len(sentences) >= 2 else text[:200]
+        if len(summary) < 20:
+             summary = "Experienced professional with a diverse background. Looking for new opportunities to apply my skills."
+             
+        skill_gaps = []
+        roadmap = []
+        top_jobs = []
+        top_role = "General Professional"
+        match_score = "0%"
+        
+        if raw_recs:
+            top_rec = raw_recs[0]
+            top_role = top_rec["Job Title"]
+            match_score = top_rec.get("Match Score", "85%")
+            
+            missing = top_rec.get("Missing Skills", [])
+            if missing:
+                # e.g., "[Power BI, Tableau -> 2 weeks learning]"
+                skill_gaps = [f"[{', '.join(m.title() for m in missing)} → 2 weeks learning]"]
+                
+                # Roadmap
+                for i, skill in enumerate(missing[:3]):
+                    roadmap.append(f"Week {i+1}: {skill.title()}")
+            else:
+                skill_gaps = ["None -> You are a perfect fit!"]
+                roadmap = ["Continue applying to top roles"]
+                
+            for rec in raw_recs[:2]:
+                company = rec["Company"]
+                top_jobs.append(f"{company} - <a href='#' class='apply-link'>Apply</a>")
+                
+        display_skills = [s.title() for s in extracted_skills[:10]]
+        
+        return {
+            "summary": summary,
+            "skills": display_skills,
+            "top_role": f"{top_role} ({match_score} match)",
+            "skill_gaps": skill_gaps,
+            "top_jobs": top_jobs,
+            "roadmap": roadmap
+        }
+        
+    except Exception as e:
+        print(f"Error generating recommendations for resume: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
