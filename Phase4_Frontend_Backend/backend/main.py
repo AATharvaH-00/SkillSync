@@ -5,6 +5,7 @@ import sys
 import os
 import pandas as pd
 import io
+import requests
 try:
     import PyPDF2
 except Exception:
@@ -31,7 +32,7 @@ MODELS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 sys.path.append(MODELS_DIR)
 
 try:
-    from job_recommendation_model import clean_job_data, extract_features, get_recommendations
+    from job_recommendation_model import clean_job_data, extract_features, get_recommendations, rank_live_jobs
 except ImportError as e:
     print(f"Error importing model: {e}")
     # Fallback for development if paths are tricky
@@ -59,6 +60,38 @@ model_state = {
 
 class SkillsRequest(BaseModel):
     skills: list[str]
+    location: str = "in"
+
+# Adzuna API Configuration
+ADZUNA_APP_ID = "8f7e349a"
+ADZUNA_APP_KEY = "3c11c55e6ea61b8774287406b88bb807"
+
+def fetch_adzuna_jobs(skills, location=""):
+    """Fetch live jobs from Adzuna based on user skills."""
+    query = " ".join(skills)
+    params = {
+        "app_id": ADZUNA_APP_ID,
+        "app_key": ADZUNA_APP_KEY,
+        "what": query,
+        "results_per_page": 10,
+        "content-type": "application/json"
+    }
+    
+    # If no location is selected, fetch across multiple countries to recommend purely on skills
+    locations_to_search = [location.lower()] if location else ["in", "us", "gb", "ca", "au"]
+    all_results = []
+    
+    for loc in locations_to_search:
+        url = f"http://api.adzuna.com/v1/api/jobs/{loc}/search/1"
+        try:
+            response = requests.get(url, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                all_results.extend(data.get("results", []))
+        except Exception as e:
+            print(f"Error fetching jobs from Adzuna for {loc}: {e}")
+            
+    return all_results
 
 @app.on_event("startup")
 async def load_model():
@@ -140,13 +173,21 @@ def recommend_jobs(payload: SkillsRequest):
         raise HTTPException(status_code=503, detail="Model is not loaded")
     
     try:
-        recommendations = get_recommendations(
+        # Fetch live jobs from Adzuna corresponding to the selected country (or globally)
+        live_jobs = fetch_adzuna_jobs(payload.skills, payload.location)
+        
+        if not live_jobs:
+             return {"recommendations": [], "message": "No live jobs found for these skills."}
+
+        # Rank the live API jobs using the model (match against user skills)
+        recommendations = rank_live_jobs(
             payload.skills,
+            live_jobs,
             model_state["tfidf"],
             model_state["mlb"],
-            model_state["embeddings"],
-            model_state["df"]
+            top_k=5
         )
+        
         return {"recommendations": recommendations}
     except Exception as e:
         print(f"Error generating recommendations: {e}")
@@ -212,14 +253,17 @@ async def analyze_resume(
         extracted_skills = ["Python", "Communication"] # default mock if none found
         
     try:
-        from job_recommendation_model import get_recommendations
-        raw_recs = get_recommendations(
-            extracted_skills,
-            model_state["tfidf"],
-            model_state["mlb"],
-            model_state["embeddings"],
-            model_state["df"]
-        )
+        # Fetch live jobs from Adzuna
+        live_jobs = fetch_adzuna_jobs(extracted_skills)
+        
+        raw_recs = []
+        if live_jobs:
+            raw_recs = rank_live_jobs(
+                extracted_skills,
+                live_jobs,
+                model_state["tfidf"],
+                model_state["mlb"]
+            )
         
         # 1. Summary (2 sentences)
         sentences = [s.strip() for s in text.replace('\\n', '. ').split('.') if s.strip()]
@@ -252,7 +296,8 @@ async def analyze_resume(
                 
             for rec in raw_recs[:2]:
                 company = rec["Company"]
-                top_jobs.append(f"{company} - <a href='#' class='apply-link'>Apply</a>")
+                url = rec.get("redirect_url", "#")
+                top_jobs.append(f"{company} - <a href='{url}' target='_blank' class='apply-link'>Apply</a>")
                 
         display_skills = [s.title() for s in extracted_skills[:10]]
         

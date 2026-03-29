@@ -49,9 +49,36 @@ def extract_features(df):
     
     return tfidf, mlb, normalized_embeddings
 
-def get_recommendations(user_skills, tfidf, mlb, embeddings, df, top_k=3):
-    """Matches user skills against the job database and identifies gaps."""
-    # Preprocess user input
+def get_recommendations(user_skills, tfidf, mlb, embeddings, df, top_k=5, location_code=""):
+    """Matches user skills against the job database and identifies gaps, filtered by optional location."""
+    
+    # 1. Location Filtering
+    if location_code:
+        # Map frontend ISO country codes to dataset cities
+        location_mapping = {
+            "in": ["Bangalore"],
+            "us": ["San Francisco", "New York"],
+            "gb": ["London"],
+            "ca": ["Toronto"],
+            "au": ["Sydney"],
+            "de": ["Berlin"]
+        }
+        
+        valid_cities = location_mapping.get(location_code.lower())
+        if valid_cities:
+            # Create a boolean mask to filter rows
+            mask = df['Location'].isin(valid_cities).values
+            
+            # If the mask has any True values, apply it
+            if mask.any():
+                df = df[mask].reset_index(drop=True)
+                embeddings = embeddings[mask]
+                
+    # If df becomes empty or is empty, return early
+    if df.empty or embeddings.shape[0] == 0:
+        return []
+
+    # 2. Preprocess user input
     user_skills_clean = [s.strip().lower() for s in user_skills]
     
     # Vectorize user input
@@ -65,9 +92,15 @@ def get_recommendations(user_skills, tfidf, mlb, embeddings, df, top_k=3):
     user_combined = hstack([user_text_vec, user_skill_vec])
     user_vec = normalize(user_combined, norm='l2')
     
-    # Calculate Similarity Scores (Dot product of normalized vectors)
+    # 3. Calculate Similarity Scores (Dot product of normalized vectors)
     scores = (embeddings @ user_vec.T).toarray().flatten()
-    top_indices = scores.argsort()[-top_k:][::-1]
+    
+    # Make sure we don't try to get top_k if there are fewer than top_k jobs
+    actual_k = min(top_k, len(scores))
+    if actual_k == 0:
+        return []
+        
+    top_indices = scores.argsort()[-actual_k:][::-1]
     
     recommendations = []
     for idx in top_indices:
@@ -83,7 +116,104 @@ def get_recommendations(user_skills, tfidf, mlb, embeddings, df, top_k=3):
             "Company": job['Company'],
             "Match Score": f"{round(scores[idx] * 100, 1)}%",
             "Missing Skills": missing_skills[:3], # Suggest top 3 missing skills
-            "Required Skills": job['skills_list']  # Include all required skills for frontend
+            "Required Skills": job['skills_list'],  # Include all required skills for frontend
+            "redirect_url": "#" # Placeholder so Apply Now button doesn't error out
+        })
+        
+    return recommendations
+
+def rank_live_jobs(user_skills, live_jobs, tfidf, mlb, top_k=5):
+    """
+    Ranks live jobs from Adzuna API based on user skills.
+    
+    Args:
+        user_skills (list): List of user skills
+        live_jobs (list): List of job dictionaries from Adzuna
+        tfidf: Trained TfidfVectorizer
+        mlb: Trained MultiLabelBinarizer
+        top_k: Number of recommendations to return
+    """
+    if not live_jobs:
+        return []
+
+    # 1. Prepare User Vector
+    user_skills_clean = [s.strip().lower() for s in user_skills]
+    user_text_vec = tfidf.transform([" ".join(user_skills_clean)])
+    user_skill_vec = mlb.transform([user_skills_clean])
+    user_skill_vec = user_skill_vec.astype(float) * 2.0
+    user_combined = hstack([user_text_vec, user_skill_vec])
+    user_vec = normalize(user_combined, norm='l2')
+
+    # 2. Process Live Jobs
+    processed_jobs = []
+    job_matrices = []
+    
+    known_skills = set(s.lower() for s in mlb.classes_)
+
+    for job in live_jobs:
+        # Extract fields from Adzuna format
+        title = job.get('title', 'Unknown Title')
+        company = job.get('company', {}).get('display_name', 'Unknown Company')
+        description = job.get('description', '')
+        redirect_url = job.get('redirect_url', '#')
+        
+        # Extract skills from description by matching against known_skills
+        desc_lower = (title + " " + description).lower()
+        extracted_skills = [skill for skill in known_skills if skill in desc_lower]
+        if not extracted_skills:
+            # Fallback if no specific skills found, use a default set or just the title
+            extracted_skills = [] 
+
+        # Vectorize job
+        job_text_vec = tfidf.transform([title + " " + description])
+        job_skill_vec = mlb.transform([extracted_skills])
+        job_skill_vec = job_skill_vec.astype(float) * 2.0
+        job_combined = hstack([job_text_vec, job_skill_vec])
+        job_vec = normalize(job_combined, norm='l2')
+        
+        job_matrices.append(job_vec)
+        
+        # Store for later
+        processed_jobs.append({
+            "Job Title": title,
+            "Company": company,
+            "Description": description,
+            "redirect_url": redirect_url,
+            "Required Skills": extracted_skills,
+            "skills_list": extracted_skills # for gap analysis consistency
+        })
+
+    if not job_matrices:
+        return []
+
+    # 3. Calculate Similarities
+    # Stack all job vectors into one sparse matrix
+    from scipy.sparse import vstack
+    combined_job_embeddings = vstack(job_matrices)
+    
+    scores = (combined_job_embeddings @ user_vec.T).toarray().flatten()
+    
+    # 4. Rank and Format
+    top_indices = scores.argsort()[-top_k:][::-1]
+    
+    recommendations = []
+    for idx in top_indices:
+        job = processed_jobs[idx]
+        score = scores[idx]
+        
+        # Skill Gap Analysis
+        job_skills_set = set(job['skills_list'])
+        user_skills_set = set(user_skills_clean)
+        missing_skills = list(job_skills_set - user_skills_set)
+        
+        recommendations.append({
+            "Job Title": job['Job Title'],
+            "Company": job['Company'],
+            "Match Score": f"{round(score * 100, 1)}%",
+            "Missing Skills": missing_skills[:3],
+            "Required Skills": job['Required Skills'],
+            "redirect_url": job['redirect_url'],
+            "Description": job['Description']
         })
         
     return recommendations
